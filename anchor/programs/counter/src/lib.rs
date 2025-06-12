@@ -1,13 +1,16 @@
 #![allow(clippy::result_large_err)]
+#![allow(unexpected_cfgs)]
 
 use anchor_lang::prelude::*;
-use anchor_spl::{associated_token::AssociatedToken, token::{ TokenAccount}, token_interface::{Mint, TokenInterface}};
+use anchor_spl::{associated_token::AssociatedToken, token_interface::{Mint, TokenInterface, TokenAccount, TransferChecked}};
 
 
 declare_id!("FqzkXZdwYjurnUKetJCAvaUw5WAqbwzU6gZEwydeEfqS");
 
 #[program]
-pub mod vesting {
+pub mod vesting { 
+    use anchor_spl::token_interface;
+
     use super::*;
 
     pub fn create_vesting_account(ctx: Context<CreateVestingAccount>, company_name: String) -> Result <()> {
@@ -40,26 +43,65 @@ pub mod vesting {
         Ok(())
     }
 
-    pub fn claim_tokens(ctx: Context<ClaimTokens>, company_name: String) -> Result <()> {
+    pub fn claim_tokens(ctx: Context<ClaimTokens>, _company_name: String) -> Result <()> {
         let employee_account = &mut ctx.accounts.employee_account;
-        let now = Clock.get()?.unix_timestamp;
+        let now = Clock::get()?.unix_timestamp;
 
-        if (now < employee_account.cliff_time) {
+        if now < employee_account.cliff_time {
             return Err(ErrorCode::ClaimNotAvailableYet.into())
         }
 
         let time_since_start = now.saturating_sub(employee_account.start_time);
         let total_vesting_time = employee_account.end_time.saturating_sub(employee_account.start_time); 
 
-        if (total_vesting_time == 0) {
+        if total_vesting_time == 0 {
             return Err(ErrorCode::InvalidVestingPeriod.into())
         }
 
+        let vested_amount = if now >= employee_account.end_time {
+            employee_account.total_amount
+        } else {
+            
+            // without the match statement checked_mul could return a none value and we wouldn't be able to do division 
+            // this way we can handle the error in case of none and handle result in case of success 
+            match employee_account.total_amount.checked_mul(time_since_start as u64) {
+                Some(result) => result / total_vesting_time as u64,
+                None => {
+                return Err(ErrorCode:: CalculationOverflow.into())
+                }   
+            }
+        };
 
-        // &ctx.accounts.employee_aacount = EmployeeAccount{
+        let claimable_amount = vested_amount.saturating_sub(employee_account.total_withdrawn);
 
-        //     total_withdrawn 
-        // } 
+        if claimable_amount == 0 {
+            return Err(ErrorCode::NothingToClaim.into())
+        }
+
+        let transfer_cpi_accounts = TransferChecked {
+            from: ctx.accounts.treasury_token_account.to_account_info(),
+            to: ctx.accounts.employee_token_account.to_account_info(),
+            authority: ctx.accounts.treasury_token_account.to_account_info(),
+            mint: ctx.accounts.beneficiary.to_account_info(),  
+        };
+
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+
+        let signer_seeds: &[&[&[u8]]] = &[
+                &[b"vesting_treasury",
+                  ctx.accounts.vesting_account.company_name.as_ref(),
+                  &[ctx.accounts.vesting_account.bump_treasury]
+                ]
+            ];
+        
+        // cpi context
+        let cpi_context = CpiContext::new(cpi_program, transfer_cpi_accounts).with_signer(signer_seeds);
+
+        let decimals = ctx.accounts.mint.decimals;
+
+        token_interface::transfer_checked(cpi_context, claimable_amount as u64, decimals)?;
+        
+        employee_account.total_withdrawn += claimable_amount;
 
         Ok(())
     }
@@ -204,6 +246,12 @@ pub enum ErrorCode {
 
     #[msg("Invalid vesting period")]
     InvalidVestingPeriod,
+
+    #[msg("Calculation overflow")]
+    CalculationOverflow,
+
+    #[msg("Nothing to claim")]
+    NothingToClaim
 }
 
 
